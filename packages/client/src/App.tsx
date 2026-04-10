@@ -1,0 +1,301 @@
+import { useEffect, useRef, useCallback } from 'react';
+import { Routes, Route, useLocation } from 'react-router-dom';
+import { useRelayStore } from './stores';
+import { useAuthStore } from './stores/authStore';
+import { useSettingsStore } from './stores/settingsStore';
+import { RelayConfig, AppConfig } from './utils/config';
+import { loadVersionInfo } from './utils/buildInfo';
+import { routeMessage } from './hooks/useMessageRouter';
+import { setWebSocket, setRelayServiceV2 } from './services/relaySender';
+import { RelayServiceV2 } from './services/relayServiceV2';
+import { syncOrchestrator } from './services/syncOrchestrator';
+import { blobService } from './services/blobService';
+import type { RelayMessage } from './services/relayService';
+import { HomePage } from './pages/HomePage';
+import { SharePage } from './pages/SharePage';
+import { useViewportHeight } from './hooks/useViewportHeight';
+
+/**
+ * 버전 정보 로드 (version.json)
+ */
+function useVersionInfo() {
+  useEffect(() => {
+    loadVersionInfo();
+  }, []);
+}
+
+/**
+ * 웹 문서 타이틀 설정
+ */
+function useDocumentTitle() {
+  useEffect(() => {
+    document.title = AppConfig.title;
+  }, []);
+}
+
+/**
+ * WebSocket 연결 및 메시지 처리 (메인 앱용)
+ *
+ * SharePage는 별도의 useShareConnection을 사용하므로
+ * /share 경로에서는 이 훅이 연결하지 않습니다.
+ */
+function useRelayConnection() {
+  const location = useLocation();
+  const { setConnected, setAuthenticated, setDeviceId } = useRelayStore();
+  const { isAuthenticated: isGoogleAuthenticated, idToken } = useAuthStore();
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // SharePage 경로인지 확인
+  const isSharePage = location.pathname.startsWith('/share');
+
+  const handleMessage = useCallback(
+    (message: RelayMessage) => {
+      console.log('[Relay] Message:', message.type);
+
+      // 인증 결과는 로컬에서 처리
+      if (message.type === 'auth_result') {
+        const payload = message.payload as {
+          success: boolean;
+          device?: { deviceId: number };
+          relayVersion?: string;
+          pylonVersions?: Record<number, string>;
+        };
+        // deviceId가 0일 수 있으므로 !== undefined로 체크
+        if (payload.success && payload.device?.deviceId !== undefined) {
+          setAuthenticated(true);
+          setDeviceId(String(payload.device.deviceId));
+
+          // 버전 정보 저장
+          if (payload.relayVersion) {
+            useSettingsStore.getState().setRelayVersion(payload.relayVersion);
+          }
+          if (payload.pylonVersions) {
+            useSettingsStore.getState().setPylonVersions(payload.pylonVersions);
+          }
+
+          // 워크스페이스 목록 요청 (syncOrchestrator 경유)
+          syncOrchestrator.startInitialSync();
+        }
+        return;
+      }
+
+      // 버전 정보 응답
+      if (message.type === 'versions') {
+        const payload = message.payload as {
+          relayVersion?: string;
+          pylonVersions?: Record<number, string>;
+        };
+        if (payload.relayVersion) {
+          useSettingsStore.getState().setRelayVersion(payload.relayVersion);
+        }
+        if (payload.pylonVersions) {
+          useSettingsStore.getState().setPylonVersions(payload.pylonVersions);
+        }
+        return;
+      }
+
+      // blob 메시지는 blobService로 전달
+      if (message.type.startsWith('blob_')) {
+        blobService.handleMessage(message as unknown as Record<string, unknown>);
+        return;
+      }
+
+      // 나머지 메시지는 routeMessage로 처리
+      routeMessage(message);
+    },
+    [setAuthenticated, setDeviceId]
+  );
+
+  useEffect(() => {
+    // SharePage에서는 연결하지 않음 (별도 useShareConnection 사용)
+    if (isSharePage) {
+      return;
+    }
+
+    // Google 로그인하지 않은 경우 연결하지 않음
+    if (!isGoogleAuthenticated) {
+      return;
+    }
+
+    const wsUrl = RelayConfig.url;
+
+    console.log('[Relay] Connecting to:', wsUrl);
+
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let intentionalClose = false; // cleanup에서 닫는 경우
+
+    const connect = () => {
+      try {
+        const ws = new WebSocket(wsUrl);
+        wsRef.current = ws; // 새 연결을 현재 활성 연결로 지정
+        setWebSocket(ws);
+
+        ws.onopen = () => {
+          console.log('[Relay] Connected');
+          setConnected(true);
+
+          // blobService에 sender 설정
+          blobService.setSender({
+            send: (data) => ws.send(JSON.stringify(data)),
+          });
+
+          // 인증 요청 (Google idToken 포함)
+          const authPayload: Record<string, unknown> = {
+            deviceType: 'app',
+          };
+
+          // Google 로그인한 경우 idToken 포함
+          const currentIdToken = useAuthStore.getState().idToken;
+          if (currentIdToken) {
+            authPayload.idToken = currentIdToken;
+          }
+
+          ws.send(
+            JSON.stringify({
+              type: 'auth',
+              payload: authPayload,
+            })
+          );
+        };
+
+        ws.onclose = () => {
+          console.log('[Relay] Disconnected');
+
+          // 이 연결이 현재 활성 연결인 경우에만 처리
+          // (HMR 등으로 새 연결이 이미 만들어진 경우 무시)
+          if (wsRef.current !== ws) {
+            console.log('[Relay] Ignoring close from stale connection');
+            return;
+          }
+
+          syncOrchestrator.cleanup();
+          setConnected(false);
+          setWebSocket(null);
+
+          // 의도적 종료(cleanup)가 아닌 경우에만 재연결
+          if (!intentionalClose && !reconnectTimer) {
+            reconnectTimer = setTimeout(() => {
+              reconnectTimer = null;
+              connect();
+            }, RelayConfig.reconnectInterval);
+          }
+        };
+
+        ws.onerror = (error) => {
+          console.error('[Relay] Error:', error);
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const message = JSON.parse(event.data) as RelayMessage;
+            handleMessage(message);
+          } catch (e) {
+            console.error('[Relay] Failed to parse message:', e);
+          }
+        };
+      } catch (error) {
+        console.error('[Relay] Connection error:', error);
+      }
+    };
+
+    connect();
+
+    // Direct connection (optional, from URL parameter ?direct=ws://...)
+    const directUrl = RelayServiceV2.parseDirectUrl(window.location.search);
+    let directWs: WebSocket | null = null;
+    let serviceV2: RelayServiceV2 | null = null;
+
+    if (directUrl) {
+      console.log('[Direct] URL detected:', directUrl);
+
+      // RelayServiceV2 설정 — relay send는 기존 globalWs 사용
+      serviceV2 = new RelayServiceV2({
+        relaySend: (msg) => {
+          const ws = wsRef.current;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(msg));
+          }
+        },
+      });
+      setRelayServiceV2(serviceV2);
+
+      // Direct WS 연결
+      const connectDirect = () => {
+        try {
+          directWs = new WebSocket(directUrl);
+
+          directWs.onmessage = (event) => {
+            try {
+              const data = JSON.parse(event.data);
+
+              if (data.type === 'direct_auth') {
+                // Handshake: Pylon이 자기 deviceId를 알려줌
+                console.log(`[Direct] Connected to Pylon ${data.pylonIndex} (deviceId: ${data.deviceId})`);
+                serviceV2!.addDirect(data.deviceId, directWs!);
+                useRelayStore.getState().addDirectDevice(data.deviceId);
+                return;
+              }
+
+              // Direct에서 온 일반 메시지 → handleMessage로 전달
+              handleMessage(data);
+            } catch (e) {
+              console.error('[Direct] Failed to parse message:', e);
+            }
+          };
+
+          directWs.onclose = () => {
+            console.log('[Direct] Disconnected, falling back to Relay');
+            useRelayStore.getState().clearDirectDevices();
+            if (serviceV2) {
+              // TODO: deviceId를 저장해서 removeDirect 호출
+            }
+          };
+
+          directWs.onerror = () => {
+            console.warn('[Direct] Connection failed, using Relay only');
+          };
+        } catch (error) {
+          console.error('[Direct] Connection error:', error);
+        }
+      };
+
+      connectDirect();
+    }
+
+    return () => {
+      intentionalClose = true; // cleanup에서 닫는 것임을 표시
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      // Clean up direct connection
+      if (directWs) {
+        directWs.close();
+        directWs = null;
+      }
+      if (serviceV2) {
+        setRelayServiceV2(null);
+        useRelayStore.getState().clearDirectDevices();
+      }
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+        setWebSocket(null);
+      }
+    };
+  }, [setConnected, handleMessage, isGoogleAuthenticated, idToken, isSharePage]);
+}
+
+export function App() {
+  useVersionInfo();
+  useDocumentTitle();
+  useViewportHeight();
+  useRelayConnection();
+
+  return (
+    <Routes>
+      <Route path="/" element={<HomePage />} />
+      <Route path="/share/:shareId" element={<SharePage />} />
+    </Routes>
+  );
+}

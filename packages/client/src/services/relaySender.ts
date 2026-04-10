@@ -1,0 +1,735 @@
+/**
+ * @file relaySender.ts
+ * @description Relay 메시지 전송 헬퍼 함수
+ *
+ * UI 컴포넌트에서 Pylon으로 메시지를 보낼 때 사용합니다.
+ * conversationId(number)를 사용하여 대화를 식별합니다.
+ *
+ * 라우팅 규칙:
+ * - conversationId가 있는 메시지: conversationId에서 pylonId 추출 → to: [pylonId]
+ * - workspaceId가 있는 메시지: workspaceId에서 pylonId 추출 → to: [pylonId]
+ * - deviceId가 지정된 메시지: to: [deviceId]
+ * - 전체 Pylon 대상 메시지: broadcast: 'pylons'
+ */
+
+import {
+  MessageType,
+  decodeConversationIdFull,
+  decodeWorkspaceId,
+} from '@estelle/core';
+import type { AccountType, ConversationId, WorkspaceId } from '@estelle/core';
+import type { RelayMessage } from './relayService';
+import type { RelayServiceV2 } from './relayServiceV2';
+
+// 전역 WebSocket 참조 (app/_layout.tsx에서 설정)
+let globalWs: WebSocket | null = null;
+
+// Optional RelayServiceV2 for direct connection support
+let relayServiceV2: RelayServiceV2 | null = null;
+
+/**
+ * WebSocket 참조 설정
+ */
+export function setWebSocket(ws: WebSocket | null): void {
+  globalWs = ws;
+}
+
+/**
+ * WebSocket 참조 가져오기
+ */
+export function getWebSocket(): WebSocket | null {
+  return globalWs;
+}
+
+/**
+ * RelayServiceV2 설정 (Direct Connection용)
+ */
+export function setRelayServiceV2(service: RelayServiceV2 | null): void {
+  relayServiceV2 = service;
+}
+
+/**
+ * RelayServiceV2 가져오기
+ */
+export function getRelayServiceV2(): RelayServiceV2 | null {
+  return relayServiceV2;
+}
+
+/**
+ * 메시지 전송
+ */
+export function sendMessage(message: RelayMessage): boolean {
+  // RelayServiceV2가 있으면 split routing 사용
+  if (relayServiceV2) {
+    relayServiceV2.send(message as any);
+    console.log('[Relay] Sent (v2):', message.type, message.to ? `to:${message.to}` : message.broadcast ? `broadcast:${message.broadcast}` : '');
+    return true;
+  }
+
+  // 기존 동작: globalWs로 직접 전송
+  if (globalWs && globalWs.readyState === WebSocket.OPEN) {
+    globalWs.send(JSON.stringify(message));
+    console.log('[Relay] Sent:', message.type, message.to ? `to:${message.to}` : message.broadcast ? `broadcast:${message.broadcast}` : '');
+    return true;
+  }
+  console.warn('[Relay] Cannot send, not connected:', message.type);
+  return false;
+}
+
+/**
+ * conversationId에서 pylonId 추출
+ */
+function getPylonIdFromConversation(conversationId: number): number {
+  const decoded = decodeConversationIdFull(conversationId as ConversationId);
+  return decoded.pylonId;
+}
+
+/**
+ * workspaceId에서 pylonId 추출
+ */
+function getPylonIdFromWorkspace(workspaceId: number): number {
+  const decoded = decodeWorkspaceId(workspaceId as WorkspaceId);
+  return decoded.pylonId;
+}
+
+// ============================================================================
+// 워크스페이스 관련
+// ============================================================================
+
+/**
+ * 워크스페이스 목록 요청
+ * - 모든 Pylon에게 요청
+ */
+export function requestWorkspaceList(): boolean {
+  return sendMessage({
+    type: MessageType.WORKSPACE_LIST,
+    payload: {},
+    broadcast: 'pylons',
+  });
+}
+
+/**
+ * 워크스페이스 생성 요청
+ * - 모든 Pylon에게 요청 (deviceId가 지정되면 해당 Pylon만)
+ */
+export function createWorkspace(name: string, workingDir: string): boolean {
+  return sendMessage({
+    type: MessageType.WORKSPACE_CREATE,
+    payload: { name, workingDir },
+    broadcast: 'pylons',
+  });
+}
+
+/**
+ * 워크스페이스 삭제 요청
+ * - workspaceId에서 pylonId 추출하여 해당 Pylon에만 전송
+ */
+export function deleteWorkspace(workspaceId: number): boolean {
+  const pylonId = getPylonIdFromWorkspace(workspaceId);
+  return sendMessage({
+    type: MessageType.WORKSPACE_DELETE,
+    payload: { workspaceId },
+    to: [pylonId],
+  });
+}
+
+/**
+ * 워크스페이스 수정 요청
+ * - workspaceId에서 pylonId 추출하여 해당 Pylon에만 전송
+ */
+export function updateWorkspace(
+  workspaceId: number,
+  updates: { name?: string; workingDir?: string }
+): boolean {
+  const pylonId = getPylonIdFromWorkspace(workspaceId);
+  return sendMessage({
+    type: MessageType.WORKSPACE_UPDATE,
+    payload: { workspaceId, ...updates },
+    to: [pylonId],
+  });
+}
+
+/**
+ * 워크스페이스 순서 변경 요청
+ * - 모든 Pylon에게 전송 (각 Pylon이 자신의 워크스페이스만 처리)
+ */
+export function reorderWorkspaces(workspaceIds: number[]): boolean {
+  return sendMessage({
+    type: MessageType.WORKSPACE_REORDER,
+    payload: { workspaceIds },
+    broadcast: 'pylons',
+  });
+}
+
+/**
+ * 대화 순서 변경 요청
+ * - workspaceId에서 pylonId 추출하여 해당 Pylon에만 전송
+ */
+export function reorderConversations(workspaceId: number, conversationIds: number[]): boolean {
+  const pylonId = getPylonIdFromWorkspace(workspaceId);
+  return sendMessage({
+    type: MessageType.CONVERSATION_REORDER,
+    payload: { workspaceId, conversationIds },
+    to: [pylonId],
+  });
+}
+
+// ============================================================================
+// 대화 관련
+// ============================================================================
+
+/**
+ * 대화 생성 요청
+ * - workspaceId에서 pylonId 추출하여 해당 Pylon에만 전송
+ */
+export function createConversation(workspaceId: number, name?: string): boolean {
+  const pylonId = getPylonIdFromWorkspace(workspaceId);
+  return sendMessage({
+    type: MessageType.CONVERSATION_CREATE,
+    payload: { workspaceId, name },
+    to: [pylonId],
+  });
+}
+
+/**
+ * 대화 선택 (히스토리 로드)
+ * - 모든 Pylon에게 브로드캐스트 (멀티 Pylon 환경에서 다른 Pylon은 deselect 처리)
+ */
+export function selectConversation(conversationId: number, workspaceId?: number): boolean {
+  return sendMessage({
+    type: MessageType.CONVERSATION_SELECT,
+    payload: { conversationId, workspaceId },
+    broadcast: 'pylons',
+  });
+}
+
+/**
+ * 추가 히스토리 요청 (페이징)
+ * - conversationId에서 pylonId 추출하여 해당 Pylon에만 전송
+ *
+ * @param conversationId - 대화 ID
+ * @param loadBefore - 이 인덱스 이전의 메시지를 로드 (현재 syncedFrom 값)
+ * @param limit - 로드할 최대 메시지 수
+ */
+export function requestMoreHistory(
+  conversationId: number,
+  loadBefore: number,
+  limit: number = 50
+): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: MessageType.HISTORY_REQUEST,
+    payload: { conversationId, loadBefore, limit },
+    to: [pylonId],
+  });
+}
+
+/**
+ * 대화 삭제 요청
+ * - conversationId에서 pylonId 추출하여 해당 Pylon에만 전송
+ */
+export function deleteConversation(conversationId: number): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: MessageType.CONVERSATION_DELETE,
+    payload: { conversationId },
+    to: [pylonId],
+  });
+}
+
+/**
+ * 대화 이름 변경 요청
+ * - conversationId에서 pylonId 추출하여 해당 Pylon에만 전송
+ */
+export function renameConversation(conversationId: number, newName: string): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: MessageType.CONVERSATION_RENAME,
+    payload: { conversationId, newName },
+    to: [pylonId],
+  });
+}
+
+// ============================================================================
+// Claude 관련
+// ============================================================================
+
+/**
+ * Claude에 메시지 전송
+ * - conversationId에서 pylonId 추출하여 해당 Pylon에만 전송
+ */
+export function sendClaudeMessage(
+  conversationId: number,
+  message: string,
+  attachments?: string[]
+): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: MessageType.CLAUDE_SEND,
+    payload: {
+      conversationId,
+      message,
+      attachments,
+    },
+    to: [pylonId],
+  });
+}
+
+/**
+ * Claude 권한 응답
+ * - conversationId에서 pylonId 추출하여 해당 Pylon에만 전송
+ */
+export function sendPermissionResponse(
+  conversationId: number,
+  toolUseId: string,
+  decision: 'allow' | 'deny'
+): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: MessageType.CLAUDE_PERMISSION,
+    payload: {
+      conversationId,
+      toolUseId,
+      decision,
+    },
+    to: [pylonId],
+  });
+}
+
+/**
+ * Claude 질문 응답
+ * - conversationId에서 pylonId 추출하여 해당 Pylon에만 전송
+ */
+export function sendQuestionResponse(
+  conversationId: number,
+  toolUseId: string,
+  answer: string
+): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: MessageType.CLAUDE_ANSWER,
+    payload: {
+      conversationId,
+      toolUseId,
+      answer,
+    },
+    to: [pylonId],
+  });
+}
+
+/**
+ * Claude 제어 (중단/재시작)
+ * - conversationId에서 pylonId 추출하여 해당 Pylon에만 전송
+ */
+export function sendClaudeControl(
+  conversationId: number,
+  action: 'stop' | 'new_session'
+): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: MessageType.CLAUDE_CONTROL,
+    payload: {
+      conversationId,
+      action,
+    },
+    to: [pylonId],
+  });
+}
+
+/**
+ * Claude 권한 모드 설정
+ * - conversationId에서 pylonId 추출하여 해당 Pylon에만 전송
+ */
+export function setPermissionMode(
+  conversationId: number,
+  mode: 'default' | 'acceptEdits' | 'bypassPermissions'
+): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: MessageType.CLAUDE_SET_PERMISSION_MODE,
+    payload: {
+      conversationId,
+      mode,
+    },
+    to: [pylonId],
+  });
+}
+
+// ============================================================================
+// 폴더 관련
+// ============================================================================
+
+/**
+ * 폴더 목록 요청
+ * - 특정 deviceId(pylonId)에 전송
+ */
+export function requestFolderList(deviceId: number, path?: string): boolean {
+  return sendMessage({
+    type: MessageType.FOLDER_LIST,
+    payload: { deviceId, path },
+    to: [deviceId],
+  });
+}
+
+/**
+ * 폴더 생성 요청
+ * - 특정 deviceId(pylonId)에 전송
+ */
+export function requestFolderCreate(deviceId: number, path: string, name: string): boolean {
+  return sendMessage({
+    type: MessageType.FOLDER_CREATE,
+    payload: { deviceId, path, name },
+    to: [deviceId],
+  });
+}
+
+/**
+ * 특정 PC에 워크스페이스 생성 요청
+ * - 특정 deviceId(pylonId)에 전송
+ */
+export function requestWorkspaceCreate(deviceId: number, name: string, workingDir: string): boolean {
+  return sendMessage({
+    type: MessageType.WORKSPACE_CREATE,
+    payload: { deviceId, name, workingDir },
+    to: [deviceId],
+  });
+}
+
+// ============================================================================
+// Usage 관련
+// ============================================================================
+
+/**
+ * Claude 사용량 조회 요청
+ * - 모든 Pylon에게 요청
+ *
+ * @description
+ * 특정 Pylon에 ccusage를 통한 사용량 조회를 요청합니다.
+ */
+export function requestUsage(): boolean {
+  return sendMessage({
+    type: MessageType.USAGE_REQUEST,
+    payload: {},
+    broadcast: 'pylons',
+  });
+}
+
+// ============================================================================
+// 버그 리포트 관련
+// ============================================================================
+
+/**
+ * 버그 리포트 전송
+ * - 모든 Pylon에게 전송
+ */
+export function sendBugReport(
+  message: string,
+  conversationId?: number,
+  workspaceId?: number
+): boolean {
+  return sendMessage({
+    type: MessageType.BUG_REPORT,
+    payload: {
+      message,
+      conversationId,
+      workspaceId,
+      timestamp: new Date().toISOString(),
+    },
+    broadcast: 'pylons',
+  });
+}
+
+// ============================================================================
+// 계정 관련
+// ============================================================================
+
+/**
+ * 계정 전환 요청
+ * - 모든 Pylon에게 전송
+ *
+ * @description
+ * Pylon에 계정 전환을 요청합니다.
+ * 모든 Claude SDK 세션이 종료되고 인증 파일이 교체됩니다.
+ */
+export function requestAccountSwitch(account: AccountType): boolean {
+  return sendMessage({
+    type: MessageType.ACCOUNT_SWITCH,
+    payload: { account },
+    broadcast: 'pylons',
+  });
+}
+
+// ============================================================================
+// 공유 관련
+// ============================================================================
+
+/**
+ * 공유 링크 생성 요청
+ * - conversationId에서 pylonId 추출하여 해당 Pylon에만 전송
+ */
+export function createShare(conversationId: number): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: MessageType.SHARE_CREATE,
+    payload: { conversationId },
+    to: [pylonId],
+  });
+}
+
+// ============================================================================
+// 슬래시 명령어 관련
+// ============================================================================
+
+/**
+ * 슬래시 명령어 목록 요청
+ * - conversationId에서 pylonId 추출하여 해당 Pylon에만 전송
+ *
+ * @description
+ * `/` 입력 시 사용 가능한 슬래시 명령어 목록을 요청합니다.
+ * Pylon은 워크스페이스의 .claude/skills 폴더에서 스킬 파일을 읽어서 반환합니다.
+ */
+export function requestSlashCommands(conversationId: number): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: MessageType.SLASH_COMMANDS_REQUEST,
+    payload: { conversationId },
+    to: [pylonId],
+  });
+}
+
+// ============================================================================
+// 자동 제안 관련
+// ============================================================================
+
+/**
+ * 제안 요청 (pull 모델)
+ * - conversationId에서 pylonId 추출하여 해당 Pylon에만 전송
+ * - Pylon은 캐시가 있으면 즉시 반환, 없으면 새로 생성
+ */
+export function requestSuggestions(conversationId: number): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: MessageType.SUGGESTION_REQUEST,
+    payload: { conversationId },
+    to: [pylonId],
+  });
+}
+
+// ============================================================================
+// 버전 정보 관련
+// ============================================================================
+
+/**
+ * 버전 정보 요청
+ * - Relay에 현재 버전 정보 요청
+ *
+ * @description
+ * 설정창에서 버전 정보를 표시하기 위해 사용합니다.
+ * Relay는 relayVersion과 pylonVersions를 반환합니다.
+ */
+export function requestVersions(): boolean {
+  return sendMessage({
+    type: 'get_versions',
+    payload: {},
+  });
+}
+
+// ============================================================================
+// Widget 관련
+// ============================================================================
+
+/**
+ * Widget 인풋 전송
+ * - conversationId에서 pylonId 추출하여 해당 Pylon에만 전송
+ *
+ * @description
+ * Widget Protocol에서 사용자 입력을 Pylon으로 전송합니다.
+ */
+export function sendWidgetInput(
+  conversationId: number,
+  sessionId: string,
+  data: Record<string, unknown>
+): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: 'widget_input',
+    payload: {
+      conversationId,
+      sessionId,
+      data,
+    },
+    to: [pylonId],
+  });
+}
+
+/**
+ * Widget 이벤트 전송
+ * - conversationId에서 pylonId 추출하여 해당 Pylon에만 전송
+ *
+ * @description
+ * Widget Protocol v2에서 위젯의 이벤트를 Pylon으로 전송합니다.
+ * WidgetScriptRenderer의 onEvent 콜백에서 호출됩니다.
+ */
+export function sendWidgetEvent(
+  conversationId: number,
+  sessionId: string,
+  data: unknown
+): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: 'widget_event',
+    payload: {
+      conversationId,
+      sessionId,
+      data,
+    },
+    to: [pylonId],
+  });
+}
+
+/**
+ * Widget 세션 유효성 검사 요청
+ * - conversationId에서 pylonId 추출하여 해당 Pylon에만 전송
+ *
+ * @description
+ * 대화 선택 시 해당 대화에 위젯 세션이 있으면 프로세스가 살아있는지 확인합니다.
+ * Pylon은 widget_check_result로 응답합니다.
+ */
+export function sendWidgetCheck(
+  conversationId: number,
+  sessionId: string
+): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: 'widget_check',
+    payload: {
+      conversationId,
+      sessionId,
+    },
+    to: [pylonId],
+  });
+}
+
+// ============================================================================
+// 매크로 관련
+// ============================================================================
+
+/**
+ * 매크로 실행
+ * - conversationId에서 pylonId 추출하여 해당 Pylon에만 전송
+ */
+export function executeMacro(macroId: number, conversationId: number, userMessage?: string): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: MessageType.MACRO_EXECUTE,
+    payload: { macroId, conversationId, ...(userMessage ? { userMessage } : {}) },
+    to: [pylonId],
+  });
+}
+
+/**
+ * 매크로 생성
+ * - 모든 Pylon에게 전송
+ */
+export function createMacro(
+  name: string,
+  icon: string | null,
+  color: string | null,
+  content: string,
+  workspaceIds?: (number | null)[]
+): boolean {
+  return sendMessage({
+    type: MessageType.MACRO_CREATE,
+    payload: { name, icon, color, content, workspaceIds },
+    broadcast: 'pylons',
+  });
+}
+
+/**
+ * 매크로 수정
+ * - 모든 Pylon에게 전송
+ */
+export function updateMacro(
+  macroId: number,
+  fields: { name?: string; icon?: string; color?: string; content?: string }
+): boolean {
+  return sendMessage({
+    type: MessageType.MACRO_UPDATE,
+    payload: { macroId, ...fields },
+    broadcast: 'pylons',
+  });
+}
+
+/**
+ * 매크로 삭제
+ * - 모든 Pylon에게 전송
+ */
+export function deleteMacro(macroId: number): boolean {
+  return sendMessage({
+    type: MessageType.MACRO_DELETE,
+    payload: { macroId },
+    broadcast: 'pylons',
+  });
+}
+
+/**
+ * 매크로 관리 대화 생성 요청
+ * - macroId 없으면 생성 모드, 있으면 편집 모드
+ */
+export function macroManageConversation(workspaceId: number, macroId?: number): boolean {
+  const pylonId = getPylonIdFromWorkspace(workspaceId);
+  return sendMessage({
+    type: MessageType.MACRO_MANAGE_CONVERSATION,
+    payload: { workspaceId, macroId },
+    to: [pylonId],
+  });
+}
+
+/**
+ * 매크로 순서 변경
+ * - workspaceId에서 pylonId 추출하여 해당 Pylon에만 전송
+ */
+export function reorderMacros(workspaceId: number, macroIds: number[]): boolean {
+  const pylonId = getPylonIdFromWorkspace(workspaceId);
+  return sendMessage({
+    type: MessageType.MACRO_REORDER,
+    payload: { workspaceId, macroIds },
+    to: [pylonId],
+  });
+}
+
+/**
+ * 매크로 워크스페이스 등록 해제 (편집바 삭제 버튼)
+ */
+export function unassignMacroFromWorkspace(macroId: number, workspaceId: number): boolean {
+  const pylonId = getPylonIdFromWorkspace(workspaceId);
+  return sendMessage({
+    type: MessageType.MACRO_ASSIGN,
+    payload: { macroId, workspaceId, assign: false },
+    to: [pylonId],
+  });
+}
+
+/**
+ * Widget 소유권 요청 전송
+ *
+ * ready 상태의 위젯에 대해 소유권을 요청합니다.
+ * - ready 상태: CLI가 시작되고 widget_render가 전송됨
+ * - running 상태: 기존 세션이 종료되고 widget_close가 기존 owner에게 전송됨
+ *
+ * @param conversationId - 대화 ID
+ * @param sessionId - 위젯 세션 ID
+ */
+export function sendWidgetClaim(
+  conversationId: number,
+  sessionId: string
+): boolean {
+  const pylonId = getPylonIdFromConversation(conversationId);
+  return sendMessage({
+    type: 'widget_claim',
+    payload: {
+      sessionId,
+    },
+    to: [pylonId],
+  });
+}

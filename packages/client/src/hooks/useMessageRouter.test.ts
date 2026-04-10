@@ -1,0 +1,910 @@
+/**
+ * @file useMessageRouter.test.ts
+ * @description 메시지 라우터 훅 테스트
+ *
+ * Relay에서 수신한 메시지를 적절한 Store에 디스패치합니다.
+ */
+
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { MessageType } from '@estelle/core';
+import type { RelayMessage } from '../services/relayService';
+
+// Conversation ID 상수
+const CONVERSATION_ID = 1001;
+
+// Store mock - 모킹을 먼저 선언
+const mockWorkspaceStore = {
+  connectedPylons: [] as Array<{ deviceId: number; deviceName: string }>,
+  workspacesByPylon: new Map<number, unknown[]>(),
+  selectedConversation: null as { conversationId: number } | null,
+  setWorkspaces: vi.fn(),
+  updateConversationStatus: vi.fn(),
+  addConnectedPylon: vi.fn(),
+};
+
+// conversationStore mock
+const mockConversationStore = {
+  states: new Map<number, unknown>(),
+  currentConversationId: null as number | null,
+  setMessages: vi.fn(),
+  setStatus: vi.fn(),
+  appendTextBuffer: vi.fn(),
+  flushTextBuffer: vi.fn(),
+  clearTextBuffer: vi.fn(),
+  clearMessages: vi.fn(),
+  addMessage: vi.fn(),
+  addPendingRequest: vi.fn(),
+  updateRealtimeUsage: vi.fn(),
+  prependMessages: vi.fn(),
+  setCurrentConversation: vi.fn(),
+  getState: vi.fn(() => ({ messages: [] })),
+  deleteConversation: vi.fn(),
+  setSlashCommands: vi.fn(),
+  setWidgetSession: vi.fn(),
+  clearWidgetSession: vi.fn(),
+  removeWidgetEventListener: vi.fn(),
+};
+
+// vi.mock은 호이스팅되므로 순서 주의
+vi.mock('../stores/workspaceStore', () => ({
+  useWorkspaceStore: {
+    getState: () => mockWorkspaceStore,
+  },
+}));
+
+vi.mock('../stores/conversationStore', () => ({
+  useConversationStore: {
+    getState: () => mockConversationStore,
+  },
+}));
+
+vi.mock('../stores/settingsStore', () => ({
+  useSettingsStore: {
+    getState: () => ({
+      setUsageSummary: vi.fn(),
+    }),
+  },
+}));
+
+// syncStore mock
+const mockSyncStore = {
+  setConversationSync: vi.fn(),
+  extendSyncedFrom: vi.fn(),
+  extendSyncedTo: vi.fn(),
+  setConversationPhase: vi.fn(),
+  setLoadingMore: vi.fn(),
+  getConversationSync: vi.fn(() => null as any),
+};
+
+vi.mock('../stores/syncStore', () => ({
+  useSyncStore: {
+    getState: () => mockSyncStore,
+  },
+}));
+
+// syncOrchestrator mock
+const mockSyncOrchestrator = {
+  onWorkspaceListReceived: vi.fn(),
+};
+
+vi.mock('../services/syncOrchestrator', () => ({
+  syncOrchestrator: mockSyncOrchestrator,
+}));
+
+// 모킹 후에 import
+const { routeMessage } = await import('./useMessageRouter');
+
+describe('routeMessage', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockWorkspaceStore.connectedPylons = [];
+    mockWorkspaceStore.selectedConversation = null;
+    mockConversationStore.currentConversationId = null;
+    mockSyncStore.getConversationSync.mockReturnValue(null);
+  });
+
+  describe('workspace messages', () => {
+    it('should route workspace_list_result to workspaceStore.setWorkspaces', () => {
+      const message: RelayMessage = {
+        type: MessageType.WORKSPACE_LIST_RESULT,
+        payload: {
+          deviceId: 1,
+          deviceName: 'Test Device',
+          workspaces: [
+            {
+              workspaceId: 'ws-1',
+              name: 'Workspace 1',
+              workingDir: '/test',
+              isActive: true,
+              conversations: [{ conversationId: CONVERSATION_ID, status: 'idle' }],
+            },
+          ],
+        },
+      };
+
+      routeMessage(message);
+
+      // Pylon 정보 저장 확인
+      expect(mockWorkspaceStore.addConnectedPylon).toHaveBeenCalledWith({
+        deviceId: 1,
+        deviceName: 'Test Device',
+      });
+
+      // setWorkspaces 호출 확인 (3번째 인자는 activeInfo, 없으면 undefined)
+      expect(mockWorkspaceStore.setWorkspaces).toHaveBeenCalledWith(1, message.payload.workspaces, undefined);
+
+      // syncOrchestrator 알림 확인
+      expect(mockSyncOrchestrator.onWorkspaceListReceived).toHaveBeenCalledWith(null);
+    });
+
+    it('should handle string deviceId', () => {
+      const message: RelayMessage = {
+        type: MessageType.WORKSPACE_LIST_RESULT,
+        payload: {
+          deviceId: '1',
+          deviceName: 'Test Device',
+          workspaces: [],
+        },
+      };
+
+      routeMessage(message);
+
+      expect(mockWorkspaceStore.addConnectedPylon).toHaveBeenCalledWith({
+        deviceId: 1,
+        deviceName: 'Test Device',
+      });
+    });
+
+    it('should pass selectedConversationId to syncOrchestrator when conversation is selected', () => {
+      mockWorkspaceStore.selectedConversation = { conversationId: CONVERSATION_ID };
+
+      const message: RelayMessage = {
+        type: MessageType.WORKSPACE_LIST_RESULT,
+        payload: {
+          deviceId: 1,
+          deviceName: 'Test Device',
+          workspaces: [],
+        },
+      };
+
+      routeMessage(message);
+
+      expect(mockSyncOrchestrator.onWorkspaceListReceived).toHaveBeenCalledWith(CONVERSATION_ID);
+    });
+  });
+
+  describe('conversation messages', () => {
+    it('should route conversation_status to workspaceStore.updateConversationStatus', () => {
+      mockWorkspaceStore.connectedPylons = [{ deviceId: 1, deviceName: 'Test' }];
+
+      const message: RelayMessage = {
+        type: MessageType.CONVERSATION_STATUS,
+        payload: {
+          conversationId: CONVERSATION_ID,
+          status: 'working',
+        },
+      };
+
+      routeMessage(message);
+
+      expect(mockWorkspaceStore.updateConversationStatus).toHaveBeenCalledWith(
+        1,
+        CONVERSATION_ID,
+        'working',
+        undefined
+      );
+    });
+
+    it('should route history_result to conversationStore.setMessages', () => {
+      mockWorkspaceStore.selectedConversation = { conversationId: CONVERSATION_ID };
+
+      const message: RelayMessage = {
+        type: MessageType.HISTORY_RESULT,
+        payload: {
+          conversationId: CONVERSATION_ID,
+          messages: [
+            { role: 'user', content: 'Hello' },
+            { role: 'assistant', content: 'Hi there!' },
+          ],
+          totalCount: 2,
+        },
+      };
+
+      routeMessage(message);
+
+      // setMessages는 이제 paging 정보 없이 호출됨 (syncStore에서 관리)
+      expect(mockConversationStore.setMessages).toHaveBeenCalledWith(CONVERSATION_ID, message.payload.messages);
+    });
+  });
+
+  describe('claude messages', () => {
+    it('should route claude_event text to conversationStore', () => {
+      mockWorkspaceStore.selectedConversation = { conversationId: CONVERSATION_ID };
+
+      const message: RelayMessage = {
+        type: MessageType.CLAUDE_EVENT,
+        payload: {
+          conversationId: CONVERSATION_ID,
+          event: {
+            type: 'text',
+            text: 'Hello from Claude',
+          },
+        },
+      };
+
+      routeMessage(message);
+
+      expect(mockConversationStore.appendTextBuffer).toHaveBeenCalledWith(CONVERSATION_ID, 'Hello from Claude');
+    });
+
+    it('should route claude_event state to conversationStore.setStatus', () => {
+      mockWorkspaceStore.selectedConversation = { conversationId: CONVERSATION_ID };
+
+      const message: RelayMessage = {
+        type: MessageType.CLAUDE_EVENT,
+        payload: {
+          conversationId: CONVERSATION_ID,
+          event: {
+            type: 'state',
+            state: 'working',
+          },
+        },
+      };
+
+      routeMessage(message);
+
+      expect(mockConversationStore.setStatus).toHaveBeenCalledWith(CONVERSATION_ID, 'working');
+    });
+
+    it('should route claude_event textComplete to conversationStore.flushTextBuffer', () => {
+      mockWorkspaceStore.selectedConversation = { conversationId: CONVERSATION_ID };
+
+      const message: RelayMessage = {
+        type: MessageType.CLAUDE_EVENT,
+        payload: {
+          conversationId: CONVERSATION_ID,
+          event: {
+            type: 'textComplete',
+          },
+        },
+      };
+
+      routeMessage(message);
+
+      expect(mockConversationStore.flushTextBuffer).toHaveBeenCalledWith(CONVERSATION_ID);
+    });
+  });
+
+  describe('syncStore update', () => {
+    it('should set syncStore range on initial HISTORY_RESULT', () => {
+      mockWorkspaceStore.selectedConversation = { conversationId: CONVERSATION_ID };
+
+      const messages = [
+        { role: 'user', content: 'Hello' },
+        { role: 'assistant', content: 'Hi there!' },
+      ];
+
+      routeMessage({
+        type: MessageType.HISTORY_RESULT,
+        payload: {
+          conversationId: CONVERSATION_ID,
+          messages,
+          totalCount: 10,
+        },
+      });
+
+      // totalCount=10, loadedCount=2 → syncedFrom=8, syncedTo=10
+      expect(mockSyncStore.setConversationSync).toHaveBeenCalledWith(CONVERSATION_ID, 8, 10, 10);
+      expect(mockSyncStore.setConversationPhase).toHaveBeenCalledWith(CONVERSATION_ID, 'synced');
+    });
+
+    it('should extend syncedFrom on paging HISTORY_RESULT', () => {
+      mockWorkspaceStore.selectedConversation = { conversationId: CONVERSATION_ID };
+
+      const messages = [
+        { role: 'user', content: 'Older message 1' },
+        { role: 'user', content: 'Older message 2' },
+      ];
+
+      routeMessage({
+        type: MessageType.HISTORY_RESULT,
+        payload: {
+          conversationId: CONVERSATION_ID,
+          messages,
+          loadBefore: 20,  // 인덱스 20 이전 메시지 로드
+          totalCount: 50,
+        },
+      });
+
+      // loadBefore=20, loadedCount=2 → newSyncedFrom = 20 - 2 = 18
+      expect(mockSyncStore.extendSyncedFrom).toHaveBeenCalledWith(CONVERSATION_ID, 18);
+      // 페이징에서는 setConversationPhase 호출 안 함
+      expect(mockSyncStore.setConversationPhase).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('unknown messages', () => {
+    it('should not throw on unknown message type', () => {
+      const message: RelayMessage = {
+        type: 'unknown_type',
+        payload: {},
+      };
+
+      expect(() => routeMessage(message)).not.toThrow();
+    });
+  });
+
+  // ==========================================================================
+  // conversation-cache-cleanup: 대화 캐시 정리 테스트
+  // ==========================================================================
+
+  describe('conversation cache cleanup', () => {
+    describe('CONVERSATION_CREATE_RESULT', () => {
+      it('should_call_deleteConversation_when_conversation_create_result_received', () => {
+        // Arrange: conversationId 1001로 기존 대화 상태가 캐시되어 있음
+        mockConversationStore.states.set(CONVERSATION_ID, { messages: [{ content: 'old' }] });
+
+        // Act: 같은 conversationId로 새 대화 생성 결과 수신
+        routeMessage({
+          type: MessageType.CONVERSATION_CREATE_RESULT,
+          payload: {
+            conversationId: CONVERSATION_ID,
+            workspaceId: 'ws-1',
+          },
+        });
+
+        // Assert: deleteConversation이 호출되어 이전 캐시 제거
+        expect(mockConversationStore.deleteConversation).toHaveBeenCalledWith(CONVERSATION_ID);
+      });
+
+      it('should_handle_conversation_create_result_without_conversationId', () => {
+        // Arrange: conversationId 없는 경우
+
+        // Act: conversationId 없이 CONVERSATION_CREATE_RESULT 수신
+        routeMessage({
+          type: MessageType.CONVERSATION_CREATE_RESULT,
+          payload: {
+            workspaceId: 'ws-1',
+          },
+        });
+
+        // Assert: conversationId 없으면 deleteConversation 호출되지 않음
+        expect(mockConversationStore.deleteConversation).not.toHaveBeenCalled();
+      });
+
+      it('should_call_deleteConversation_even_when_no_cached_state_exists', () => {
+        // Arrange: 캐시에 해당 conversationId 없음
+        mockConversationStore.states.clear();
+
+        // Act: 새 대화 생성 결과 수신
+        routeMessage({
+          type: MessageType.CONVERSATION_CREATE_RESULT,
+          payload: {
+            conversationId: CONVERSATION_ID,
+          },
+        });
+
+        // Assert: 캐시가 없어도 deleteConversation 호출 (방어적 처리)
+        expect(mockConversationStore.deleteConversation).toHaveBeenCalledWith(CONVERSATION_ID);
+      });
+    });
+
+    describe('WORKSPACE_LIST_RESULT with deleted conversations', () => {
+      it('should_call_deleteConversation_for_removed_conversations', () => {
+        // Arrange: 기존에 conversationId 1001, 1002가 있었는데 새 목록에는 1002만 있음
+        mockWorkspaceStore.workspacesByPylon.set(1, [
+          {
+            workspaceId: 'ws-1',
+            conversations: [
+              { conversationId: CONVERSATION_ID },
+              { conversationId: 1002 },
+            ],
+          },
+        ]);
+        mockConversationStore.states.set(CONVERSATION_ID, { messages: [] });
+        mockConversationStore.states.set(1002, { messages: [] });
+
+        // Act: 새 워크스페이스 목록 수신 (1001 삭제됨)
+        routeMessage({
+          type: MessageType.WORKSPACE_LIST_RESULT,
+          payload: {
+            deviceId: 1,
+            deviceName: 'Test Device',
+            workspaces: [
+              {
+                workspaceId: 'ws-1',
+                conversations: [
+                  { conversationId: 1002 },
+                ],
+              },
+            ],
+          },
+        });
+
+        // Assert: 삭제된 대화의 캐시 정리
+        expect(mockConversationStore.deleteConversation).toHaveBeenCalledWith(CONVERSATION_ID);
+        expect(mockConversationStore.deleteConversation).not.toHaveBeenCalledWith(1002);
+      });
+
+      it('should_call_deleteConversation_for_multiple_removed_conversations', () => {
+        // Arrange: conversationId 1001, 1002, 1003이 있었는데 새 목록에는 1002만 있음
+        mockWorkspaceStore.workspacesByPylon.set(1, [
+          {
+            workspaceId: 'ws-1',
+            conversations: [
+              { conversationId: CONVERSATION_ID },
+              { conversationId: 1002 },
+              { conversationId: 1003 },
+            ],
+          },
+        ]);
+
+        // Act: 새 워크스페이스 목록 수신 (1001, 1003 삭제됨)
+        routeMessage({
+          type: MessageType.WORKSPACE_LIST_RESULT,
+          payload: {
+            deviceId: 1,
+            deviceName: 'Test Device',
+            workspaces: [
+              {
+                workspaceId: 'ws-1',
+                conversations: [
+                  { conversationId: 1002 },
+                ],
+              },
+            ],
+          },
+        });
+
+        // Assert: 삭제된 대화들의 캐시 정리
+        expect(mockConversationStore.deleteConversation).toHaveBeenCalledWith(CONVERSATION_ID);
+        expect(mockConversationStore.deleteConversation).toHaveBeenCalledWith(1003);
+        expect(mockConversationStore.deleteConversation).not.toHaveBeenCalledWith(1002);
+      });
+
+      it('should_not_call_deleteConversation_when_no_conversations_removed', () => {
+        // Arrange: 기존 목록과 동일
+        mockWorkspaceStore.workspacesByPylon.set(1, [
+          {
+            workspaceId: 'ws-1',
+            conversations: [
+              { conversationId: CONVERSATION_ID },
+            ],
+          },
+        ]);
+
+        // Act: 동일한 목록 수신
+        routeMessage({
+          type: MessageType.WORKSPACE_LIST_RESULT,
+          payload: {
+            deviceId: 1,
+            deviceName: 'Test Device',
+            workspaces: [
+              {
+                workspaceId: 'ws-1',
+                conversations: [
+                  { conversationId: CONVERSATION_ID },
+                ],
+              },
+            ],
+          },
+        });
+
+        // Assert: deleteConversation 호출되지 않음
+        expect(mockConversationStore.deleteConversation).not.toHaveBeenCalled();
+      });
+
+      it('should_handle_first_workspace_list_without_previous_data', () => {
+        // Arrange: 이전 데이터 없음 (첫 연결)
+        mockWorkspaceStore.workspacesByPylon.clear();
+
+        // Act: 첫 워크스페이스 목록 수신
+        routeMessage({
+          type: MessageType.WORKSPACE_LIST_RESULT,
+          payload: {
+            deviceId: 1,
+            deviceName: 'Test Device',
+            workspaces: [
+              {
+                workspaceId: 'ws-1',
+                conversations: [
+                  { conversationId: CONVERSATION_ID },
+                ],
+              },
+            ],
+          },
+        });
+
+        // Assert: deleteConversation 호출되지 않음 (비교 대상 없음)
+        expect(mockConversationStore.deleteConversation).not.toHaveBeenCalled();
+      });
+
+      it('should_handle_workspace_deletion_with_all_conversations', () => {
+        // Arrange: 워크스페이스 자체가 삭제된 경우
+        mockWorkspaceStore.workspacesByPylon.set(1, [
+          {
+            workspaceId: 'ws-1',
+            conversations: [
+              { conversationId: CONVERSATION_ID },
+            ],
+          },
+          {
+            workspaceId: 'ws-2',
+            conversations: [
+              { conversationId: 1002 },
+            ],
+          },
+        ]);
+
+        // Act: ws-1 워크스페이스 자체가 삭제됨
+        routeMessage({
+          type: MessageType.WORKSPACE_LIST_RESULT,
+          payload: {
+            deviceId: 1,
+            deviceName: 'Test Device',
+            workspaces: [
+              {
+                workspaceId: 'ws-2',
+                conversations: [
+                  { conversationId: 1002 },
+                ],
+              },
+            ],
+          },
+        });
+
+        // Assert: 삭제된 워크스페이스의 대화 캐시 정리
+        expect(mockConversationStore.deleteConversation).toHaveBeenCalledWith(CONVERSATION_ID);
+        expect(mockConversationStore.deleteConversation).not.toHaveBeenCalledWith(1002);
+      });
+    });
+  });
+
+  // ==========================================================================
+  // reconnect-state-sync: 재연결 시 상태 동기화 테스트
+  // ==========================================================================
+
+  describe('reconnect state sync', () => {
+    describe('CONVERSATION_STATUS without convState', () => {
+      it('should set status even when convState does not exist', () => {
+        // Arrange: convState가 존재하지 않는 상태
+        mockWorkspaceStore.connectedPylons = [{ deviceId: 1, deviceName: 'Test' }];
+        mockConversationStore.getState.mockReturnValue(null as any); // convState 없음
+
+        // Act: CONVERSATION_STATUS 수신
+        routeMessage({
+          type: MessageType.CONVERSATION_STATUS,
+          payload: {
+            conversationId: CONVERSATION_ID,
+            status: 'idle',
+          },
+        });
+
+        // Assert: convState가 없어도 setStatus가 호출되어야 함
+        expect(mockConversationStore.setStatus).toHaveBeenCalledWith(CONVERSATION_ID, 'idle');
+      });
+
+      it('should initialize convState and set status when receiving working status', () => {
+        // Arrange
+        mockWorkspaceStore.connectedPylons = [{ deviceId: 1, deviceName: 'Test' }];
+        mockConversationStore.getState.mockReturnValue(null as any);
+
+        // Act
+        routeMessage({
+          type: MessageType.CONVERSATION_STATUS,
+          payload: {
+            conversationId: CONVERSATION_ID,
+            status: 'working',
+          },
+        });
+
+        // Assert: 상태가 설정되어야 함
+        expect(mockConversationStore.setStatus).toHaveBeenCalledWith(CONVERSATION_ID, 'working');
+      });
+    });
+
+    describe('HISTORY_RESULT with currentStatus', () => {
+      it('should set status from currentStatus in history_result', () => {
+        // Arrange
+        mockWorkspaceStore.selectedConversation = { conversationId: CONVERSATION_ID };
+
+        // Act: currentStatus가 포함된 HISTORY_RESULT 수신
+        routeMessage({
+          type: MessageType.HISTORY_RESULT,
+          payload: {
+            conversationId: CONVERSATION_ID,
+            messages: [],
+            totalCount: 0,
+            currentStatus: 'working',
+          },
+        });
+
+        // Assert: currentStatus로 상태가 설정되어야 함
+        expect(mockConversationStore.setStatus).toHaveBeenCalledWith(CONVERSATION_ID, 'working');
+      });
+
+      it('should set idle status when currentStatus is idle', () => {
+        // Arrange
+        mockWorkspaceStore.selectedConversation = { conversationId: CONVERSATION_ID };
+
+        // Act
+        routeMessage({
+          type: MessageType.HISTORY_RESULT,
+          payload: {
+            conversationId: CONVERSATION_ID,
+            messages: [],
+            totalCount: 0,
+            currentStatus: 'idle',
+          },
+        });
+
+        // Assert
+        expect(mockConversationStore.setStatus).toHaveBeenCalledWith(CONVERSATION_ID, 'idle');
+      });
+
+      it('should set permission status when currentStatus is permission', () => {
+        // Arrange
+        mockWorkspaceStore.selectedConversation = { conversationId: CONVERSATION_ID };
+
+        // Act
+        routeMessage({
+          type: MessageType.HISTORY_RESULT,
+          payload: {
+            conversationId: CONVERSATION_ID,
+            messages: [],
+            totalCount: 0,
+            currentStatus: 'permission',
+          },
+        });
+
+        // Assert
+        expect(mockConversationStore.setStatus).toHaveBeenCalledWith(CONVERSATION_ID, 'permission');
+      });
+    });
+  });
+
+  // ==========================================================================
+  // slash_commands_result 메시지 처리 테스트
+  // ==========================================================================
+
+  describe('slash_commands_result', () => {
+    it('should_store_slashCommands_when_result_received', () => {
+      // Arrange & Act
+      routeMessage({
+        type: MessageType.SLASH_COMMANDS_RESULT,
+        payload: {
+          conversationId: CONVERSATION_ID,
+          slashCommands: ['/compact', '/clear', '/help', '/tdd-flow'],
+        },
+      });
+
+      // Assert
+      expect(mockConversationStore.setSlashCommands).toHaveBeenCalledWith(
+        CONVERSATION_ID,
+        ['/compact', '/clear', '/help', '/tdd-flow']
+      );
+    });
+
+    it('should_not_call_setSlashCommands_when_conversationId_missing', () => {
+      // Arrange & Act
+      routeMessage({
+        type: MessageType.SLASH_COMMANDS_RESULT,
+        payload: {
+          slashCommands: ['/compact', '/clear'],
+        },
+      });
+
+      // Assert
+      expect(mockConversationStore.setSlashCommands).not.toHaveBeenCalled();
+    });
+
+    it('should_not_call_setSlashCommands_when_slashCommands_missing', () => {
+      // Arrange & Act
+      routeMessage({
+        type: MessageType.SLASH_COMMANDS_RESULT,
+        payload: {
+          conversationId: CONVERSATION_ID,
+        },
+      });
+
+      // Assert
+      expect(mockConversationStore.setSlashCommands).not.toHaveBeenCalled();
+    });
+  });
+
+  // ==========================================================================
+  // Widget 세션 관리 테스트 (Task 8-11)
+  // ==========================================================================
+
+  describe('widget session management', () => {
+    describe('widget_render', () => {
+      it('should_require_conversationId_in_widget_render', () => {
+        // Task 8: conversationId 필수
+        // Arrange: conversationId 없이 widget_render 수신
+
+        // Act
+        routeMessage({
+          type: 'widget_render',
+          payload: {
+            toolUseId: 'tool-1',
+            sessionId: 'session-1',
+            view: { type: 'script', html: '<div>Hello</div>' },
+          },
+        });
+
+        // Assert: conversationId 없으면 setWidgetSession 호출되지 않음
+        expect(mockConversationStore.setWidgetSession).not.toHaveBeenCalled();
+      });
+
+      it('should_call_setWidgetSession_when_all_required_fields_present', () => {
+        // Task 8: 모든 필수 필드가 있으면 정상 처리
+        // Arrange
+        const view = { type: 'script', html: '<div>Hello</div>' };
+
+        // Act
+        routeMessage({
+          type: 'widget_render',
+          payload: {
+            conversationId: CONVERSATION_ID,
+            toolUseId: 'tool-1',
+            sessionId: 'session-1',
+            view,
+          },
+        });
+
+        // Assert
+        expect(mockConversationStore.setWidgetSession).toHaveBeenCalledWith(
+          CONVERSATION_ID,
+          'tool-1',
+          'session-1',
+          view
+        );
+      });
+
+      it('should_not_fallback_to_selectedConversation', () => {
+        // Task 8: fallback 제거 검증
+        // Arrange: selectedConversation 설정해도 무시됨
+        mockWorkspaceStore.selectedConversation = { conversationId: CONVERSATION_ID };
+
+        // Act: conversationId 없이 전송
+        routeMessage({
+          type: 'widget_render',
+          payload: {
+            toolUseId: 'tool-1',
+            sessionId: 'session-1',
+            view: { type: 'text', content: 'Hello' },
+          },
+        });
+
+        // Assert: fallback 사용하지 않음
+        expect(mockConversationStore.setWidgetSession).not.toHaveBeenCalled();
+      });
+
+      it('should_ignore_widget_render_without_toolUseId', () => {
+        // Task 8: toolUseId 필수
+        routeMessage({
+          type: 'widget_render',
+          payload: {
+            conversationId: CONVERSATION_ID,
+            sessionId: 'session-1',
+            view: { type: 'text', content: 'Hello' },
+          },
+        });
+
+        expect(mockConversationStore.setWidgetSession).not.toHaveBeenCalled();
+      });
+
+      it('should_ignore_widget_render_without_sessionId', () => {
+        // Task 8: sessionId 필수
+        routeMessage({
+          type: 'widget_render',
+          payload: {
+            conversationId: CONVERSATION_ID,
+            toolUseId: 'tool-1',
+            view: { type: 'text', content: 'Hello' },
+          },
+        });
+
+        expect(mockConversationStore.setWidgetSession).not.toHaveBeenCalled();
+      });
+
+      it('should_ignore_widget_render_without_view', () => {
+        // Task 8: view 필수
+        routeMessage({
+          type: 'widget_render',
+          payload: {
+            conversationId: CONVERSATION_ID,
+            toolUseId: 'tool-1',
+            sessionId: 'session-1',
+          },
+        });
+
+        expect(mockConversationStore.setWidgetSession).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('widget_close', () => {
+      it('should_require_conversationId_in_widget_close', () => {
+        // Task 8: widget_close에서도 conversationId 필수
+        // Arrange: selectedConversation 설정해도 무시
+        mockWorkspaceStore.selectedConversation = { conversationId: CONVERSATION_ID };
+
+        // Act
+        routeMessage({
+          type: 'widget_close',
+          payload: {
+            toolUseId: 'tool-1',
+            sessionId: 'session-1',
+          },
+        });
+
+        // Assert: fallback 사용하지 않음
+        expect(mockConversationStore.clearWidgetSession).not.toHaveBeenCalled();
+      });
+
+      it('should_call_clearWidgetSession_when_conversationId_present', () => {
+        // Act
+        routeMessage({
+          type: 'widget_close',
+          payload: {
+            conversationId: CONVERSATION_ID,
+            toolUseId: 'tool-1',
+            sessionId: 'session-1',
+          },
+        });
+
+        // Assert
+        expect(mockConversationStore.clearWidgetSession).toHaveBeenCalledWith(CONVERSATION_ID);
+      });
+    });
+
+    describe('widget_check_result', () => {
+      it('should_clear_widget_session_when_invalid', () => {
+        // Task 9: widget_check_result 핸들러
+        // Arrange: invalid = true면 위젯 세션 정리
+
+        // Act
+        routeMessage({
+          type: 'widget_check_result',
+          payload: {
+            conversationId: CONVERSATION_ID,
+            sessionId: 'session-1',
+            valid: false,
+          },
+        });
+
+        // Assert
+        expect(mockConversationStore.clearWidgetSession).toHaveBeenCalledWith(CONVERSATION_ID);
+        expect(mockConversationStore.removeWidgetEventListener).toHaveBeenCalledWith('session-1');
+      });
+
+      it('should_not_clear_widget_session_when_valid', () => {
+        // Task 9: valid=true면 아무것도 하지 않음
+        routeMessage({
+          type: 'widget_check_result',
+          payload: {
+            conversationId: CONVERSATION_ID,
+            sessionId: 'session-1',
+            valid: true,
+          },
+        });
+
+        expect(mockConversationStore.clearWidgetSession).not.toHaveBeenCalled();
+        expect(mockConversationStore.removeWidgetEventListener).not.toHaveBeenCalled();
+      });
+
+      it('should_not_clear_when_conversationId_missing', () => {
+        // Task 9: conversationId 없으면 무시
+        routeMessage({
+          type: 'widget_check_result',
+          payload: {
+            sessionId: 'session-1',
+            valid: false,
+          },
+        });
+
+        expect(mockConversationStore.clearWidgetSession).not.toHaveBeenCalled();
+      });
+    });
+  });
+});

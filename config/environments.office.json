@@ -1,0 +1,30 @@
+{
+  "envId": 0,
+  "relay": {
+    "port": 8080,
+    "url": "ws://YOUR_SERVER_IP:8080"
+  },
+  "pylon": {
+    "pylonIndex": "1",
+    "relayUrl": "ws://YOUR_SERVER_IP:8080",
+    "pm2Name": "estelle-pylon",
+    "configDir": "~/.claude-release",
+    "credentialsBackupDir": "~/.claude-credentials/release",
+    "mcpPort": 9876,
+    "dataDir": "./release-data/data",
+    "defaultWorkingDir": "C:\\WorkSpace",
+    "directPort": 5000
+  },
+  "tunnel": {
+    "enabled": false,
+    "mode": "listen",
+    "pm2Name": "estelle-tunnel",
+    "slack": {
+      "botToken": "",
+      "appToken": "",
+      "channelId": "C0APQJX0UGL"
+    },
+    "listenPort": 4000,
+    "connectPort": 8080
+  }
+}

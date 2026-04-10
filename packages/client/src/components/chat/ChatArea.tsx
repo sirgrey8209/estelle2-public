@@ -1,0 +1,271 @@
+import { useCallback, useEffect, useRef } from 'react';
+import { MessageList } from './MessageList';
+import { InputBar } from './InputBar';
+import { RequestBar } from '../requests/RequestBar';
+import { ChatHeader } from './ChatHeader';
+import { useWorkspaceStore, useConversationStore, useCurrentConversationState, useSyncStore } from '../../stores';
+import { useImageUploadStore } from '../../stores/imageUploadStore';
+import { sendClaudeMessage, sendClaudeControl, requestMoreHistory } from '../../services/relaySender';
+import { blobService } from '../../services/blobService';
+import { useFileDrop } from '../../hooks/useFileDrop';
+import { processFiles } from '../../utils/fileUtils';
+import type { AttachedImage } from '../../stores/imageUploadStore';
+import type { UserTextMessage } from '@estelle/core';
+
+/**
+ * 채팅 영역
+ *
+ * 메시지 목록, 입력바, 작업 표시기를 포함합니다.
+ */
+export function ChatArea() {
+  // conversationStore에서 현재 대화의 상태 가져오기
+  const currentConversationId = useConversationStore((s) => s.currentConversationId);
+  const currentState = useCurrentConversationState();
+  const status = currentState?.status ?? 'idle';
+  const hasPendingRequests = (currentState?.pendingRequests?.length ?? 0) > 0;
+
+  const { selectedConversation, connectedPylons } = useWorkspaceStore();
+  const { queueMessage, dequeueMessage, clearAttachedImages, addAttachedImage, startBlobUpload, updateBlobProgress, completeBlobUpload } = useImageUploadStore();
+
+  const isWorking = status === 'working';
+
+  // 드래그 드롭 파일 처리
+  const handleFileDrop = useCallback((files: File[]) => {
+    const attachedFiles = processFiles(files);
+    for (const attached of attachedFiles) {
+      addAttachedImage(attached);
+    }
+  }, [addAttachedImage]);
+
+  const { isDragging, handlers: dropHandlers } = useFileDrop(handleFileDrop, {
+    disabled: isWorking,
+  });
+
+  // 업로드 완료 후 메시지 전송을 위한 ref
+  const pendingMessageRef = useRef<{
+    text: string;
+    conversationId: number;
+    workspaceId: string;
+    pylonPaths: string[];
+    thumbnails: (string | undefined)[];
+    attachments: AttachedImage[];
+  } | null>(null);
+
+  // blobService 진행률 리스너
+  useEffect(() => {
+    const unsubscribe = blobService.onProgress((blobId, processed, total) => {
+      // 업로드만 처리 (다운로드는 무시)
+      const transfer = blobService.getTransfer(blobId);
+      if (!transfer || !transfer.isUpload) return;
+
+      // 첫 번째 진행률 이벤트에서 upload 시작 처리
+      const { blobUploads } = useImageUploadStore.getState();
+      if (!blobUploads[blobId]) {
+        startBlobUpload({
+          blobId,
+          filename: transfer.filename ?? 'unknown',
+          totalChunks: total,
+        });
+      }
+      updateBlobProgress(blobId, processed);
+    });
+    return unsubscribe;
+  }, [startBlobUpload, updateBlobProgress]);
+
+  // blobService 업로드 완료 리스너
+  useEffect(() => {
+    const unsubscribe = blobService.onUploadComplete((event) => {
+      // blobUpload 상태 업데이트
+      completeBlobUpload(event.blobId, event.pylonPath);
+
+      const pending = pendingMessageRef.current;
+      if (!pending) return;
+
+      // pylonPath 및 thumbnail 추가
+      pending.pylonPaths.push(event.pylonPath);
+      pending.thumbnails.push(event.thumbnailBase64);
+
+      // 모든 업로드 완료 확인
+      if (pending.pylonPaths.length >= pending.attachments.length) {
+        // 사용자 메시지를 store에 추가 (optimistic update)
+        const userMessage: UserTextMessage = {
+          id: `user-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          role: 'user',
+          type: 'text',
+          content: pending.text,
+          timestamp: Date.now(),
+          temporary: true,
+          attachments: pending.attachments.map((a, i) => ({
+            filename: a.fileName,
+            path: pending.pylonPaths[i] || a.uri,
+            thumbnail: pending.thumbnails[i],
+          })),
+        };
+        // conversationStore에 메시지 추가
+        if (pending.conversationId) {
+          useConversationStore.getState().addMessage(pending.conversationId, userMessage);
+        }
+
+        // Relay로 메시지 전송 (conversationId + pylonPath 사용)
+        sendClaudeMessage(
+          pending.conversationId,
+          pending.text,
+          pending.pylonPaths
+        );
+
+        // 상태 정리
+        pendingMessageRef.current = null;
+        clearAttachedImages();
+      }
+    });
+
+    return unsubscribe;
+  }, [clearAttachedImages, completeBlobUpload]);
+
+  // 메시지 전송 핸들러
+  const handleSend = useCallback(async (text: string, attachments?: AttachedImage[]) => {
+    if (!selectedConversation) return;
+
+    const conversationId = selectedConversation.conversationId;
+    const workspaceId = selectedConversation.workspaceId;
+
+    // 첨부파일이 있고 File 객체가 있으면 업로드 플로우 실행
+    const attachmentsWithFile = attachments?.filter((a) => a.file);
+    if (attachmentsWithFile && attachmentsWithFile.length > 0) {
+      // 타겟 Pylon 찾기: 현재 선택된 대화의 pylonId와 일치하는 Pylon 사용
+      const targetPylon = connectedPylons.find(
+        (p) => p.deviceId === selectedConversation.pylonId
+      );
+      if (!targetPylon) {
+        console.error('[ChatArea] Target Pylon not connected:', selectedConversation.pylonId);
+        return;
+      }
+
+      // 메시지 큐잉 (업로드 완료 후 전송)
+      queueMessage(text);
+
+      // pending 상태 설정
+      pendingMessageRef.current = {
+        text,
+        conversationId,
+        workspaceId,
+        pylonPaths: [],
+        thumbnails: [],
+        attachments: attachmentsWithFile,
+      };
+
+      // 각 첨부파일 업로드 (startUpload는 onProgress 콜백에서 자동 호출됨)
+      for (const attachment of attachmentsWithFile) {
+        if (!attachment.file) continue;
+
+        try {
+          const bytes = new Uint8Array(await attachment.file.arrayBuffer());
+          await blobService.uploadImageBytes({
+            bytes,
+            filename: attachment.fileName,
+            targetDeviceId: targetPylon.deviceId,
+            workspaceId,
+            conversationId,
+            message: text,
+            mimeType: attachment.mimeType,
+          });
+        } catch (e) {
+          console.error('[ChatArea] Upload error:', e);
+          // 에러 시 pending 상태 정리
+          pendingMessageRef.current = null;
+          dequeueMessage();
+        }
+      }
+
+      return;
+    }
+
+    // 첨부파일 없이 메시지만 전송
+    // 사용자 메시지를 store에 직접 추가 (optimistic update)
+    const userMessage: UserTextMessage = {
+      id: `user-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      role: 'user',
+      type: 'text',
+      content: text,
+      timestamp: Date.now(),
+      temporary: true,
+      attachments: attachments?.map((a) => ({
+        filename: a.fileName,
+        path: a.uri,
+      })),
+    };
+    // conversationStore에 메시지 추가
+    useConversationStore.getState().addMessage(conversationId, userMessage);
+
+    // Relay로 메시지 전송
+    sendClaudeMessage(conversationId, text, attachments?.map(a => a.uri));
+  }, [selectedConversation, connectedPylons, queueMessage, dequeueMessage]);
+
+  // 중지 핸들러
+  const handleStop = useCallback(() => {
+    if (!selectedConversation) return;
+
+    sendClaudeControl(selectedConversation.conversationId, 'stop');
+  }, [selectedConversation]);
+
+  const showRequestBar = hasPendingRequests;
+
+  // 페이징 상태 (syncStore에서 가져옴)
+  const syncInfo = useSyncStore((s) => currentConversationId ? s.getConversationSync(currentConversationId) : null);
+  const hasMoreBefore = useSyncStore((s) => currentConversationId ? s.hasMoreBefore(currentConversationId) : false);
+  const isLoadingMore = useSyncStore((s) => currentConversationId ? s.isLoadingMore(currentConversationId) : false);
+
+  // 추가 히스토리 로드 핸들러
+  const handleLoadMoreHistory = useCallback(() => {
+    if (!selectedConversation || isLoadingMore || !hasMoreBefore) return;
+
+    const conversationId = selectedConversation.conversationId;
+
+    // 로딩 상태 설정
+    useSyncStore.getState().setLoadingMore(conversationId, true);
+
+    // loadBefore = syncedFrom (이 인덱스 이전의 메시지를 로드)
+    const currentSyncInfo = useSyncStore.getState().getConversationSync(conversationId);
+    const loadBefore = currentSyncInfo?.syncedFrom ?? 0;
+    requestMoreHistory(conversationId, loadBefore);
+  }, [selectedConversation, isLoadingMore, hasMoreBefore]);
+
+  return (
+    <div
+      className="flex-1 flex flex-col h-full overflow-hidden bg-background relative"
+      {...dropHandlers}
+    >
+      {/* 드래그 드롭 오버레이 */}
+      {isDragging && (
+        <div className="absolute inset-0 z-50 bg-primary/10 border-2 border-dashed border-primary rounded-lg flex items-center justify-center pointer-events-none">
+          <div className="bg-background/90 px-6 py-4 rounded-lg shadow-lg">
+            <p className="text-lg font-medium text-primary">파일을 여기에 놓으세요</p>
+            <p className="text-sm text-muted-foreground">여러 파일을 한 번에 첨부할 수 있습니다</p>
+          </div>
+        </div>
+      )}
+
+      {/* 채팅 헤더 */}
+      <ChatHeader />
+
+      {/* 메시지 목록 (WorkingIndicator 포함) */}
+      <MessageList
+        hasMoreHistory={hasMoreBefore}
+        isLoadingHistory={isLoadingMore}
+        onLoadMoreHistory={handleLoadMoreHistory}
+      />
+
+      {/* 권한/질문 요청 바 */}
+      {showRequestBar ? (
+        <RequestBar />
+      ) : (
+        /* 입력 바 - 권한 요청 중에는 숨김 */
+        <InputBar
+          disabled={isWorking}
+          onSend={handleSend}
+          onStop={handleStop}
+        />
+      )}
+    </div>
+  );
+}

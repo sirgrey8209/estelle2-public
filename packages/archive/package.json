@@ -1,0 +1,22 @@
+{
+  "name": "@estelle/archive",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "glob": "^11.0.0",
+    "google-auth-library": "^10.6.2"
+  },
+  "devDependencies": {
+    "@types/archiver": "^7.0.0"
+  }
+}

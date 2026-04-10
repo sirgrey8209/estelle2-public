@@ -1,0 +1,139 @@
+/**
+ * @file claude-sdk-adapter.ts
+ * @description Claude Agent SDK를 래핑하는 어댑터
+ *
+ * @anthropic-ai/claude-agent-sdk의 query 함수를 AgentAdapter 인터페이스에 맞게 래핑합니다.
+ * SDK의 메시지를 그대로 전달하므로 AgentManager에서 처리합니다.
+ *
+ * @example
+ * ```typescript
+ * import { ClaudeSDKAdapter } from './claude-sdk-adapter.js';
+ *
+ * const adapter = new ClaudeSDKAdapter();
+ *
+ * const manager = new AgentManager({
+ *   adapter,
+ *   onEvent: (sessionId, event) => console.log(event),
+ *   getPermissionMode: () => 'default',
+ * });
+ * ```
+ */
+
+import {
+  query,
+  type CanUseTool,
+  type PermissionResult,
+  type McpServerConfig,
+  type SettingSource,
+  type SdkPluginConfig,
+} from '@anthropic-ai/claude-agent-sdk';
+import type {
+  AgentAdapter,
+  AgentQueryOptions,
+  AgentMessage,
+  PermissionCallbackResult,
+} from './agent-manager.js';
+
+/**
+ * v2의 PermissionCallbackResult를 SDK의 canUseTool 형식으로 래핑
+ *
+ * SDK의 canUseTool은 세 번째 매개변수로 options를 받고,
+ * deny 시 message가 필수입니다.
+ */
+function wrapCanUseTool(
+  canUseTool?: (
+    toolName: string,
+    input: Record<string, unknown>
+  ) => Promise<PermissionCallbackResult>
+): CanUseTool | undefined {
+  if (!canUseTool) return undefined;
+
+  return async (
+    toolName: string,
+    input: Record<string, unknown>,
+    _options: {
+      signal: AbortSignal;
+      suggestions?: unknown[];
+      blockedPath?: string;
+      decisionReason?: string;
+      toolUseID: string;
+      agentID?: string;
+    }
+  ): Promise<PermissionResult> => {
+    const result = await canUseTool(toolName, input);
+
+    if (result.behavior === 'allow') {
+      return {
+        behavior: 'allow',
+        updatedInput: result.updatedInput,
+      };
+    } else {
+      return {
+        behavior: 'deny',
+        message: result.message || 'Permission denied',
+      };
+    }
+  };
+}
+
+/**
+ * Claude Agent SDK 어댑터
+ *
+ * @description
+ * @anthropic-ai/claude-agent-sdk의 query 함수를 AgentAdapter 인터페이스로 래핑합니다.
+ * SDK에서 반환하는 메시지 스트림을 그대로 yield합니다.
+ *
+ * SDK 메시지 타입:
+ * - system (subtype: init): 세션 초기화
+ * - assistant: Agent 응답 (텍스트, 도구 사용)
+ * - user: 도구 실행 결과
+ * - stream_event: 스트리밍 이벤트 (토큰, 델타)
+ * - tool_progress: 도구 실행 진행 상황
+ * - result: 최종 결과 (비용, 토큰 사용량)
+ */
+export class ClaudeSDKAdapter implements AgentAdapter {
+  /**
+   * Agent에 쿼리 실행
+   *
+   * @param options - 쿼리 옵션
+   * @returns SDK 메시지 스트림
+   */
+  async *query(options: AgentQueryOptions): AsyncIterable<AgentMessage> {
+    // SDK가 CLAUDECODE=1을 감지하면 중첩 세션으로 판단하여 spawn을 거부하므로 제거
+    const baseEnv = options.env ?? (process.env as Record<string, string>);
+    const { CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, CLAUDE_AGENT_SDK_VERSION, ...cleanEnv } = baseEnv;
+
+    const sdkOptions: Record<string, unknown> = {
+      cwd: options.cwd,
+      abortController: options.abortController,
+      includePartialMessages: options.includePartialMessages ?? true,
+      settingSources: (options.settingSources ?? ['user', 'project', 'local']) as SettingSource[],
+      resume: options.resume,
+      forkSession: options.forkSession,
+      mcpServers: options.mcpServers as Record<string, McpServerConfig> | undefined,
+      canUseTool: wrapCanUseTool(options.canUseTool),
+      env: cleanEnv,
+      plugins: options.plugins as SdkPluginConfig[] | undefined,
+      stderr: (data: string) => {
+        console.error(`[ClaudeSDK:stderr] ${data}`);
+      },
+    };
+
+    // systemPrompt 전달 (undefined가 아닌 경우에만, 빈 문자열도 전달)
+    if (options.systemPrompt !== undefined) {
+      sdkOptions.systemPrompt = options.systemPrompt;
+    }
+
+    // SDK query 호출
+    const sdkQuery = query({
+      prompt: options.prompt,
+      options: sdkOptions,
+    });
+
+    // SDK 메시지를 그대로 yield
+    // SDK 메시지 타입과 AgentMessage 타입이 호환되므로 변환 없이 전달
+    for await (const msg of sdkQuery) {
+      yield msg as AgentMessage;
+    }
+  }
+}

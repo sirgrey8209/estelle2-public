@@ -1,0 +1,10 @@
+packages:
+  - packages/*
+  - '!packages/app-flutter'
+
+ignoredBuiltDependencies:
+  - esbuild
+  - sharp
+
+onlyBuiltDependencies:
+  - better-sqlite3

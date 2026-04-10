@@ -1,0 +1,372 @@
+/**
+ * @file claude-sdk-adapter.test.ts
+ * @description ClaudeSDKAdapter 테스트
+ *
+ * SDK 자체는 모킹하고 어댑터 로직만 테스트합니다.
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { AgentQueryOptions, AgentMessage } from '../../src/agent/agent-manager.js';
+
+// SDK 모킹
+vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
+  query: vi.fn(),
+}));
+
+import { query as mockQuery } from '@anthropic-ai/claude-agent-sdk';
+import { ClaudeSDKAdapter } from '../../src/agent/claude-sdk-adapter.js';
+
+describe('ClaudeSDKAdapter', () => {
+  let adapter: ClaudeSDKAdapter;
+
+  beforeEach(() => {
+    adapter = new ClaudeSDKAdapter();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * 모킹된 SDK 응답 생성
+   */
+  function createMockSDKResponse(messages: AgentMessage[]): AsyncIterable<AgentMessage> {
+    return {
+      async *[Symbol.asyncIterator]() {
+        for (const msg of messages) {
+          yield msg;
+        }
+      },
+    };
+  }
+
+  // ============================================================================
+  // 기본 동작 테스트
+  // ============================================================================
+  describe('기본 동작', () => {
+    it('should create adapter instance', () => {
+      expect(adapter).toBeInstanceOf(ClaudeSDKAdapter);
+    });
+
+    it('should call SDK query with correct options', async () => {
+      const mockMessages: AgentMessage[] = [];
+      vi.mocked(mockQuery).mockReturnValue(createMockSDKResponse(mockMessages));
+
+      const options: AgentQueryOptions = {
+        prompt: 'Hello',
+        cwd: '/test/dir',
+        abortController: new AbortController(),
+        includePartialMessages: true,
+        settingSources: ['project'],
+      };
+
+      // 메시지 수집
+      const messages: AgentMessage[] = [];
+      for await (const msg of adapter.query(options)) {
+        messages.push(msg);
+      }
+
+      // SDK가 올바른 옵션으로 호출되었는지 확인
+      expect(mockQuery).toHaveBeenCalledWith({
+        prompt: 'Hello',
+        options: expect.objectContaining({
+          cwd: '/test/dir',
+          abortController: options.abortController,
+          includePartialMessages: true,
+          settingSources: ['project'],
+          resume: undefined,
+          mcpServers: undefined,
+          canUseTool: undefined,
+        }),
+      });
+    });
+
+    it('should use default values when options are not provided', async () => {
+      const mockMessages: AgentMessage[] = [];
+      vi.mocked(mockQuery).mockReturnValue(createMockSDKResponse(mockMessages));
+
+      const options: AgentQueryOptions = {
+        prompt: 'Hello',
+        cwd: '/test/dir',
+        abortController: new AbortController(),
+        // includePartialMessages, settingSources 생략
+      };
+
+      for await (const _msg of adapter.query(options)) {
+        // 메시지 소비
+      }
+
+      // 기본값 확인 - prompt와 핵심 옵션만 검증
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.objectContaining({
+          prompt: 'Hello',
+          options: expect.objectContaining({
+            includePartialMessages: true,
+          }),
+        })
+      );
+    });
+  });
+
+  // ============================================================================
+  // 메시지 스트리밍 테스트
+  // ============================================================================
+  describe('메시지 스트리밍', () => {
+    it('should yield all messages from SDK', async () => {
+      const mockMessages: AgentMessage[] = [
+        { type: 'system', subtype: 'init', session_id: 'sess-1', model: 'claude-3' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'Hello' }] } },
+        { type: 'result', total_cost_usd: 0.001, num_turns: 1 },
+      ];
+      vi.mocked(mockQuery).mockReturnValue(createMockSDKResponse(mockMessages));
+
+      const options: AgentQueryOptions = {
+        prompt: 'Hello',
+        cwd: '/test/dir',
+        abortController: new AbortController(),
+      };
+
+      const messages: AgentMessage[] = [];
+      for await (const msg of adapter.query(options)) {
+        messages.push(msg);
+      }
+
+      expect(messages).toHaveLength(3);
+      expect(messages[0].type).toBe('system');
+      expect(messages[1].type).toBe('assistant');
+      expect(messages[2].type).toBe('result');
+    });
+
+    it('should pass through stream_event messages', async () => {
+      const mockMessages: AgentMessage[] = [
+        {
+          type: 'stream_event',
+          event: {
+            type: 'content_block_delta',
+            delta: { type: 'text_delta', text: 'Hello' },
+          },
+        },
+        {
+          type: 'stream_event',
+          event: {
+            type: 'content_block_delta',
+            delta: { type: 'text_delta', text: ' World' },
+          },
+        },
+      ];
+      vi.mocked(mockQuery).mockReturnValue(createMockSDKResponse(mockMessages));
+
+      const options: AgentQueryOptions = {
+        prompt: 'Hello',
+        cwd: '/test/dir',
+        abortController: new AbortController(),
+      };
+
+      const messages: AgentMessage[] = [];
+      for await (const msg of adapter.query(options)) {
+        messages.push(msg);
+      }
+
+      expect(messages).toHaveLength(2);
+      expect(messages[0].event?.delta?.text).toBe('Hello');
+      expect(messages[1].event?.delta?.text).toBe(' World');
+    });
+  });
+
+  // ============================================================================
+  // 옵션 전달 테스트
+  // ============================================================================
+  describe('옵션 전달', () => {
+    it('should pass resume option for session continuation', async () => {
+      const mockMessages: AgentMessage[] = [];
+      vi.mocked(mockQuery).mockReturnValue(createMockSDKResponse(mockMessages));
+
+      const options: AgentQueryOptions = {
+        prompt: 'Continue',
+        cwd: '/test/dir',
+        abortController: new AbortController(),
+        resume: 'previous-session-id',
+      };
+
+      for await (const _msg of adapter.query(options)) {
+        // 메시지 소비
+      }
+
+      expect(mockQuery).toHaveBeenCalledWith({
+        prompt: 'Continue',
+        options: expect.objectContaining({
+          resume: 'previous-session-id',
+        }),
+      });
+    });
+
+    it('should pass mcpServers option', async () => {
+      const mockMessages: AgentMessage[] = [];
+      vi.mocked(mockQuery).mockReturnValue(createMockSDKResponse(mockMessages));
+
+      const mcpServers = {
+        'my-server': { command: 'node', args: ['server.js'] },
+      };
+
+      const options: AgentQueryOptions = {
+        prompt: 'Hello',
+        cwd: '/test/dir',
+        abortController: new AbortController(),
+        mcpServers,
+      };
+
+      for await (const _msg of adapter.query(options)) {
+        // 메시지 소비
+      }
+
+      expect(mockQuery).toHaveBeenCalledWith({
+        prompt: 'Hello',
+        options: expect.objectContaining({
+          mcpServers,
+        }),
+      });
+    });
+
+    it('should wrap and pass canUseTool callback', async () => {
+      const mockMessages: AgentMessage[] = [];
+      vi.mocked(mockQuery).mockReturnValue(createMockSDKResponse(mockMessages));
+
+      const canUseTool = vi.fn().mockResolvedValue({ behavior: 'allow' });
+
+      const options: AgentQueryOptions = {
+        prompt: 'Hello',
+        cwd: '/test/dir',
+        abortController: new AbortController(),
+        canUseTool,
+      };
+
+      for await (const _msg of adapter.query(options)) {
+        // 메시지 소비
+      }
+
+      // canUseTool이 래핑되어 함수로 전달되는지 확인
+      expect(mockQuery).toHaveBeenCalledWith({
+        prompt: 'Hello',
+        options: expect.objectContaining({
+          canUseTool: expect.any(Function),
+        }),
+      });
+    });
+  });
+
+  // ============================================================================
+  // systemPrompt 전달 테스트
+  // ============================================================================
+  describe('systemPrompt 전달', () => {
+    it('should_pass_systemPrompt_string_to_sdk', async () => {
+      // Arrange
+      const mockMessages: AgentMessage[] = [];
+      vi.mocked(mockQuery).mockReturnValue(createMockSDKResponse(mockMessages));
+
+      const options: AgentQueryOptions = {
+        prompt: 'Hello',
+        cwd: '/test/dir',
+        abortController: new AbortController(),
+        systemPrompt: 'You are a helpful assistant.',
+      };
+
+      // Act
+      for await (const _msg of adapter.query(options)) {
+        // 메시지 소비
+      }
+
+      // Assert
+      expect(mockQuery).toHaveBeenCalledWith({
+        prompt: 'Hello',
+        options: expect.objectContaining({
+          systemPrompt: 'You are a helpful assistant.',
+        }),
+      });
+    });
+
+    it('should_pass_systemPrompt_preset_with_append_to_sdk', async () => {
+      // Arrange
+      const mockMessages: AgentMessage[] = [];
+      vi.mocked(mockQuery).mockReturnValue(createMockSDKResponse(mockMessages));
+
+      const systemPromptPreset = {
+        type: 'preset' as const,
+        preset: 'claude_code' as const,
+        append: '## Custom Instructions\nAlways be helpful.',
+      };
+
+      const options: AgentQueryOptions = {
+        prompt: 'Hello',
+        cwd: '/test/dir',
+        abortController: new AbortController(),
+        systemPrompt: systemPromptPreset,
+      };
+
+      // Act
+      for await (const _msg of adapter.query(options)) {
+        // 메시지 소비
+      }
+
+      // Assert
+      expect(mockQuery).toHaveBeenCalledWith({
+        prompt: 'Hello',
+        options: expect.objectContaining({
+          systemPrompt: {
+            type: 'preset',
+            preset: 'claude_code',
+            append: '## Custom Instructions\nAlways be helpful.',
+          },
+        }),
+      });
+    });
+
+    it('should_not_include_systemPrompt_when_undefined', async () => {
+      // Arrange
+      const mockMessages: AgentMessage[] = [];
+      vi.mocked(mockQuery).mockReturnValue(createMockSDKResponse(mockMessages));
+
+      const options: AgentQueryOptions = {
+        prompt: 'Hello',
+        cwd: '/test/dir',
+        abortController: new AbortController(),
+        // systemPrompt 생략
+      };
+
+      // Act
+      for await (const _msg of adapter.query(options)) {
+        // 메시지 소비
+      }
+
+      // Assert - systemPrompt가 없어야 함
+      const callArgs = vi.mocked(mockQuery).mock.calls[0][0];
+      expect(callArgs.options.systemPrompt).toBeUndefined();
+    });
+
+    it('should_pass_empty_string_systemPrompt_when_explicitly_set', async () => {
+      // Arrange
+      const mockMessages: AgentMessage[] = [];
+      vi.mocked(mockQuery).mockReturnValue(createMockSDKResponse(mockMessages));
+
+      const options: AgentQueryOptions = {
+        prompt: 'Hello',
+        cwd: '/test/dir',
+        abortController: new AbortController(),
+        systemPrompt: '', // 명시적으로 빈 문자열 설정
+      };
+
+      // Act
+      for await (const _msg of adapter.query(options)) {
+        // 메시지 소비
+      }
+
+      // Assert - 빈 문자열도 전달되어야 함
+      expect(mockQuery).toHaveBeenCalledWith({
+        prompt: 'Hello',
+        options: expect.objectContaining({
+          systemPrompt: '',
+        }),
+      });
+    });
+  });
+});

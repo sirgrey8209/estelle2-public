@@ -1,0 +1,8 @@
+{
+  "masterUrl": "ws://YOUR_SERVER_IP:9900",
+  "machines": {
+    "YOUR_OFFICE_IP": { "environmentFile": "environments.office.json" },
+    "YOUR_OFFICE_IP": { "environmentFile": "environments.office.json" },
+    "YOUR_SERVER_IP": { "environmentFile": "environments.cloud.json" }
+  }
+}

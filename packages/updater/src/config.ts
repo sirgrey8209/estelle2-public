@@ -1,0 +1,39 @@
+/**
+ * Configuration loader for estelle-updater
+ */
+import fs from 'fs';
+import path from 'path';
+import type { UpdaterConfig } from './types.js';
+
+export function loadConfig(configPath: string): UpdaterConfig {
+  const raw = fs.readFileSync(configPath, 'utf-8');
+  const parsed = JSON.parse(raw);
+  if (parsed.machines && !parsed.whitelist) {
+    parsed.whitelist = Object.keys(parsed.machines);
+  }
+  return parsed as UpdaterConfig;
+}
+
+export function parseMasterIp(masterUrl: string): string {
+  // ws://YOUR_SERVER_IP:9900 → YOUR_SERVER_IP
+  const url = new URL(masterUrl);
+  return url.hostname;
+}
+
+export function getDefaultConfigPath(): string {
+  // Find repo root by looking for package.json with workspaces
+  let dir = process.cwd();
+  let prevDir = '';
+  while (dir !== prevDir) {  // Cross-platform: stops when dirname no longer changes
+    const pkgPath = path.join(dir, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+      if (pkg.workspaces) {
+        return path.join(dir, 'config', 'updater.json');
+      }
+    }
+    prevDir = dir;
+    dir = path.dirname(dir);
+  }
+  return path.join(process.cwd(), 'config', 'updater.json');
+}

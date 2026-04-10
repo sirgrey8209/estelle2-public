@@ -1,0 +1,339 @@
+/**
+ * @file server.ts
+ * @description Estelle MCP Server
+ *
+ * Pylon이 Claude SDK에 등록하는 MCP 서버.
+ * Claude가 대화 중 사용할 수 있는 도구를 제공합니다.
+ *
+ * 등록 도구:
+ * - send_file: 사용자에게 파일 전송
+ * - link_doc / unlink_doc / list_docs: 문서 연결 관리
+ * - get_status: 현재 대화/Pylon 상태 조회
+ * - create_macro / update_macro / delete_macro / list_macros / get_macro / assign_macro / unassign_macro: 매크로 관리
+ */
+
+import fs from 'fs';
+import path from 'path';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js';
+import { executeSendFile } from './tools/send-file.js';
+import {
+  executeLinkDoc,
+  executeUnlinkDoc,
+  executeListDocs,
+  getLinkDocToolDefinition,
+  getUnlinkDocToolDefinition,
+  getListDocsToolDefinition,
+} from './tools/link-document.js';
+import { executeGetStatus, getStatusToolDefinition } from './tools/get-status.js';
+import {
+  executeCreateConversation,
+  executeDeleteConversation,
+  executeRenameConversation,
+  getCreateConversationToolDefinition,
+  getDeleteConversationToolDefinition,
+  getRenameConversationToolDefinition,
+} from './tools/conversation.js';
+import {
+  executeAddPrompt,
+  getAddPromptToolDefinition,
+} from './tools/system-prompt.js';
+import {
+  executeContinueTask,
+  getContinueTaskToolDefinition,
+} from './tools/continue-task.js';
+import {
+  executeNewSession,
+  getNewSessionToolDefinition,
+} from './tools/new-session.js';
+import {
+  executeRunWidget,
+  getRunWidgetToolDefinition,
+} from './tools/run-widget.js';
+import {
+  executeRunWidgetInline,
+  getRunWidgetInlineToolDefinition,
+} from './tools/run-widget-inline.js';
+import {
+  executeCreateMacro,
+  executeUpdateMacro,
+  executeDeleteMacro,
+  executeListMacros,
+  executeGetMacro,
+  executeAssignMacro,
+  executeUnassignMacro,
+  getCreateMacroToolDefinition,
+  getUpdateMacroToolDefinition,
+  getDeleteMacroToolDefinition,
+  getListMacrosToolDefinition,
+  getGetMacroToolDefinition,
+  getAssignMacroToolDefinition,
+  getUnassignMacroToolDefinition,
+} from './tools/macro.js';
+import {
+  executeArchiveWrite,
+  executeArchiveRead,
+  executeArchiveList,
+  executeArchiveGlob,
+  executeArchiveGrep,
+  executeArchiveDelete,
+  executeArchiveRename,
+  getArchiveWriteDefinition,
+  getArchiveReadDefinition,
+  getArchiveListDefinition,
+  getArchiveGlobDefinition,
+  getArchiveGrepDefinition,
+  getArchiveDeleteDefinition,
+  getArchiveRenameDefinition,
+} from './tools/archive.js';
+
+const WORKING_DIR = process.env.ESTELLE_WORKING_DIR || process.cwd();
+
+// DEBUG: 파일 로그 (DATA_DIR/logs/ 에 저장)
+// DATA_DIR이 상대경로일 경우 ESTELLE_WORKING_DIR 기준으로 절대경로 변환
+const rawDataDir = process.env.DATA_DIR || './data';
+const DATA_DIR = path.isAbsolute(rawDataDir) ? rawDataDir : path.join(WORKING_DIR, rawDataDir);
+const LOG_DIR = path.join(DATA_DIR, 'logs');
+const LOG_FILE = path.join(LOG_DIR, 'mcp-server.log');
+
+// 로그 디렉토리 생성
+try {
+  if (!fs.existsSync(LOG_DIR)) {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+  }
+} catch {
+  // 디렉토리 생성 실패 무시
+}
+
+function debugLog(message: string): void {
+  const timestamp = new Date().toISOString();
+  const logLine = `[${timestamp}] ${message}\n`;
+  try {
+    fs.appendFileSync(LOG_FILE, logLine);
+  } catch {
+    // 로그 실패 무시
+  }
+}
+
+const server = new Server(
+  { name: 'estelle-mcp', version: '2.0.0' },
+  { capabilities: { tools: {} } },
+);
+
+// 도구 목록
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: 'send_file',
+      description: '사용자에게 파일을 전송합니다. 이미지, 마크다운, 텍스트 파일을 사용자 화면에 표시할 수 있습니다.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          path: {
+            type: 'string',
+            description: '전송할 파일의 절대 경로 또는 상대 경로',
+          },
+          description: {
+            type: 'string',
+            description: '파일에 대한 간단한 설명 (선택)',
+          },
+        },
+        required: ['path'],
+      },
+    },
+    getLinkDocToolDefinition(),
+    getUnlinkDocToolDefinition(),
+    getListDocsToolDefinition(),
+    getStatusToolDefinition,
+    getCreateConversationToolDefinition(),
+    getDeleteConversationToolDefinition(),
+    getRenameConversationToolDefinition(),
+    getAddPromptToolDefinition(),
+    getContinueTaskToolDefinition(),
+    getNewSessionToolDefinition(),
+    getRunWidgetToolDefinition(),
+    getRunWidgetInlineToolDefinition(),
+    getCreateMacroToolDefinition(),
+    getUpdateMacroToolDefinition(),
+    getDeleteMacroToolDefinition(),
+    getListMacrosToolDefinition(),
+    getGetMacroToolDefinition(),
+    getAssignMacroToolDefinition(),
+    getUnassignMacroToolDefinition(),
+    getArchiveWriteDefinition(),
+    getArchiveReadDefinition(),
+    getArchiveListDefinition(),
+    getArchiveGlobDefinition(),
+    getArchiveGrepDefinition(),
+    getArchiveDeleteDefinition(),
+    getArchiveRenameDefinition(),
+  ],
+}));
+
+// 도구 실행
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const meta = (request.params as Record<string, unknown>)._meta as Record<string, unknown> | undefined;
+  const toolUseId = (meta?.['claudecode/toolUseId'] as string) || '';
+
+  debugLog(`[MCP] Tool call: ${request.params.name}, toolUseId: ${toolUseId}`);
+
+  const { name, arguments: args } = request.params;
+
+  switch (name) {
+    case 'send_file': {
+      const result = await executeSendFile(args as { path?: string; description?: string }, { toolUseId });
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'link_doc': {
+      const result = await executeLinkDoc(args as { path?: string }, { toolUseId });
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'unlink_doc': {
+      const result = await executeUnlinkDoc(args as { path?: string }, { toolUseId });
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'list_docs': {
+      const result = await executeListDocs(args as Record<string, unknown>, { toolUseId });
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'get_status': {
+      const result = await executeGetStatus(args as Record<string, unknown>, { toolUseId });
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'create_conversation': {
+      const result = await executeCreateConversation(args as { name?: string; files?: string[] }, { toolUseId });
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'delete_conversation': {
+      const result = await executeDeleteConversation(args as { target?: string }, { toolUseId });
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'rename_conversation': {
+      const result = await executeRenameConversation(args as { newName?: string; target?: string }, { toolUseId });
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'add_prompt': {
+      const result = await executeAddPrompt(args as { path?: string }, { toolUseId });
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'continue_task': {
+      const result = await executeContinueTask(args as { reason?: string }, { toolUseId });
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'new_session': {
+      const result = await executeNewSession(args as Record<string, unknown>, { toolUseId });
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'run_widget': {
+      const result = await executeRunWidget(
+        args as { command?: string; cwd?: string; args?: string[] },
+        { toolUseId }
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'run_widget_inline': {
+      const result = await executeRunWidgetInline(
+        args as { html: string; code?: string; height?: number },
+        { toolUseId }
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'create_macro': {
+      const result = await executeCreateMacro(
+        args as { name?: string; icon?: string; color?: string; content?: string; workspaceIds?: (number | null)[] },
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'update_macro': {
+      const result = await executeUpdateMacro(
+        args as { macroId?: number; name?: string; icon?: string; color?: string; content?: string },
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'delete_macro': {
+      const result = await executeDeleteMacro(
+        args as { macroId?: number },
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'list_macros': {
+      const result = await executeListMacros(
+        args as { workspaceId?: number },
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'get_macro': {
+      const result = await executeGetMacro(
+        args as { macroId?: number },
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'assign_macro': {
+      const result = await executeAssignMacro(
+        args as { macroId?: number; workspaceIds?: (number | null)[] },
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'unassign_macro': {
+      const result = await executeUnassignMacro(
+        args as { macroId?: number; workspaceIds?: (number | null)[] },
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'archive_write': {
+      const result = await executeArchiveWrite(
+        args as { path?: string; content?: string },
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'archive_read': {
+      const result = await executeArchiveRead(
+        args as { path?: string },
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'archive_list': {
+      const result = await executeArchiveList(
+        args as { path?: string; depth?: number },
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'archive_glob': {
+      const result = await executeArchiveGlob(
+        args as { pattern?: string; nocase?: boolean },
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'archive_grep': {
+      const result = await executeArchiveGrep(
+        args as { query?: string; path?: string },
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'archive_delete': {
+      const result = await executeArchiveDelete(
+        args as { path?: string; recursive?: boolean },
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    case 'archive_rename': {
+      const result = await executeArchiveRename(
+        args as { from?: string; to?: string },
+      );
+      return result as unknown as Record<string, unknown>;
+    }
+    default:
+      return {
+        content: [{ type: 'text' as const, text: `Unknown tool: ${name}` }],
+        isError: true,
+      } as Record<string, unknown>;
+  }
+});
+
+// 실행
+const transport = new StdioServerTransport();
+server.connect(transport).catch(console.error);
